@@ -15,6 +15,9 @@ import random
 import math
 import datetime as dt
 import matplotlib.pyplot as plt
+import xgboost as xgb
+from sklearn.svm import SVR
+from sklearn.preprocessing import MinMaxScaler
 
 import numpy as np
 import pandas as pd
@@ -191,6 +194,61 @@ def LoadProcessedTrainData(filename):
     #print(TrainDataD)
     return TrainDataD
 
+
+def XGBRegressor(X_train, y_train, X_test, y_test):
+    reg = xgb.XGBRegressor(base_score=0.5, booster='gbtree',
+                           n_estimators=1000,
+                           early_stopping_rounds=50,
+                           objective='reg:linear',
+                           max_depth=3,
+                           learning_rate=0.01)
+    reg.fit(X_train, y_train,
+            eval_set=[(X_train, y_train), (X_test, y_test)],
+            verbose=100)
+def RandomForest(trainX, trainy, testX, testy):
+
+    # we are using random forest here, feel free to swap this out
+    # with your favorite regression model
+    model = RandomForestRegressor(max_depth=6, n_estimators=50)
+    model.fit(trainX, trainy)
+    prediction = model.predict(testX)
+    print('prediction = ', prediction)
+
+    plt.figure(figsize=(15, 7))
+
+    x = range(prediction.size)
+    plt.plot(x, prediction, label='prediction', linewidth=2.0)
+    plt.plot(x, testy, label='actual', linewidth=2.0)
+    error = mean_absolute_percentage_error(prediction, testy)
+    plt.title('Mean absolute percentage error {0:.2f}%'.format(error))
+    plt.legend(loc='best')
+    plt.tight_layout()
+    plt.grid(True)
+    plt.show()
+
+def SupportVectorRegression(x_train, y_train,x_test,y_test):
+    model = SVR(kernel='rbf', gamma=0.5, C=10, epsilon=0.05)
+    model.fit(x_train, y_train[:, 0])
+
+    SVR(C=10, cache_size=200, coef0=0.0, degree=3, epsilon=0.05, gamma=0.5,
+        kernel='rbf', max_iter=-1, shrinking=True, tol=0.001, verbose=False)
+    y_train_pred = model.predict(x_train).reshape(-1, 1)
+    y_test_pred = model.predict(x_test).reshape(-1, 1)
+
+    print(y_train_pred.shape, y_test_pred.shape)
+    # Scaling the predictions
+    scaler = MinMaxScaler(feature_range=(-1, 1))
+    y_train_pred = scaler.inverse_transform(y_train_pred)
+    y_test_pred = scaler.inverse_transform(y_test_pred)
+
+    print(len(y_train_pred), len(y_test_pred))
+
+    # Scaling the original values
+    y_train = scaler.inverse_transform(y_train)
+    y_test = scaler.inverse_transform(y_test)
+
+    print(len(y_train), len(y_test))
+
 #------------------------------------------------------------------------------------
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
@@ -249,26 +307,11 @@ if __name__ == '__main__':
     testX, testy = test_df.iloc[:, 1:], test_df.iloc[:, 0]
     #print('train y = ', trainX)
 
-    # we are using random forest here, feel free to swap this out
-    # with your favorite regression model
-    model = RandomForestRegressor(max_depth=6, n_estimators=50)
-    model.fit(trainX, trainy)
-    prediction = model.predict(testX)
-    print('prediction = ', prediction)
-
-    plt.figure(figsize=(15, 7))
-
-    x = range(prediction.size)
-    plt.plot(x, prediction, label='prediction', linewidth=2.0)
-    plt.plot(x, testy, label='actual', linewidth=2.0)
-    error = mean_absolute_percentage_error(prediction, testy)
-    plt.title('Mean absolute percentage error {0:.2f}%'.format(error))
-    plt.legend(loc='best')
-    plt.tight_layout()
-    plt.grid(True)
-    plt.show()
-
-
+    #Random forest
+    #LinearRegression()
+    RandomForest(trainX, trainy, testX, testy)
+    XGBRegressor(trainX, trainy, testX, testy)
+    #SupportVectorRegression()
 
 
 
