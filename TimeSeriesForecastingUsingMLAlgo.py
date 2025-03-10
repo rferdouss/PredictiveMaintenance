@@ -27,10 +27,15 @@ from sklearn.model_selection import GridSearchCV
 from sklearn import svm  #Import svm model
 from sklearn.naive_bayes import GaussianNB  #Import naive-bayes classifier model
 from sklearn.neighbors import KNeighborsClassifier  # Import k-nearest-neighbor-classification
+from sktime.classification.distance_based import KNeighborsTimeSeriesClassifier
 from sklearn.linear_model import LogisticRegression  # Import logistic regression
+
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.metrics import classification_report
 
 from xgboost import XGBRegressor
 #from fbprophet import Prophet
+
 from sklearn.svm import SVR
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from sklearn.linear_model import LinearRegression
@@ -51,11 +56,19 @@ outputfname=trainComp+"-DiagnosticMaintenanceData"
 outputdiagnosticfname=trainComp+"-DiagnosticData"
 outputfeaturelist = trainComp+"-Feature"
 
+#-------------------------Global Variable need to define-------------------------------------------------------------------------
+#Train information
+trainname = 'TSR'
+trainnumber = '070'  # T1 =070, T2 = 086, T3 =040, T4 = 008, T5=020 , T6=033, T7=, T8= ,T9=
+traincomponent = 'TCU'
+
+#smapling and feature engineering parameters - to be decided
 intervaltime = 7 #Sampling the data   # weekly =7 , bi-weekly =15, monthly =30
 AlertThresholdPercentageGlobal = 0.1 # value range = [0 -1], 0.70 means 70% of the max alert is considered
-testdatasize =0.4
-NumberOfLagToBeConsider =4 # Number of previous data should be considered
-
+testdatasize =0.4  # for splitting the dataset into train and test set
+NumberOfLagToBeConsider =8 # Number of previous data should be considered
+featureflagall = True  # Whether to use all features or a set of most important features
+#-----------------------------------------------------------------------------------------------------------------------
 
 #-------------------------------------------------------------------------------------------------------------------------
 #   Extraction of features
@@ -208,7 +221,12 @@ def GetAlertforADuration(TrainData, trainID, intervaltime):
                                                                       'WeekofYear':weekofYear,'StartDate':startdate,
                                                                       'EndDate':enddate,'Maintenance': nummaintenance,
                                                                       'NumAlerts': numalert, 'NumCriticalAlerts':numcriticalalert,
-                                                                      'CriticalAlertCodeList':alertcode, 'CriticalAlertColor': alertcolor, 'AvgAlert': avgalert, 'AvgCriticalAlert': avgcriticalalert, 'AlertAboveThreshold': alertabovemaxalert, 'CriticalAlertAboveThreshold':alertabovemaxcriticalalert,'NumDayWithMaxAlert': numdaywithmaxalert, 'NumDayWithMaxCriticalAlert': numdaywithmaxcriticalalert}
+                                                                      'CriticalAlertCodeList':alertcode, 'CriticalAlertColor': alertcolor,
+                                                                      'AvgAlert': avgalert, 'AvgCriticalAlert': avgcriticalalert,
+                                                                      'AlertAboveThreshold': alertabovemaxalert,
+                                                                      'CriticalAlertAboveThreshold':alertabovemaxcriticalalert,
+                                                                      'NumDayWithMaxAlert': numdaywithmaxalert,
+                                                                      'NumDayWithMaxCriticalAlert': numdaywithmaxcriticalalert}
             index=index+1
             datecount = 0
             numalert = 0
@@ -273,7 +291,7 @@ def GetAlertforADuration(TrainData, trainID, intervaltime):
     outputdataAnalysisfile = outputlocation + '\\' + trainID + '-' + outputfeaturelist
     pickle.dump(TrainData, open(outputdataAnalysisfile, "wb"))
 
-    return TrainMaintenanceDiagnosticInfoForAnTimeInterval, max_alert_in_a_week, max_criticalalert_in_a_week
+    return TrainMaintenanceDiagnosticInfoForAnTimeInterval, max_alert_in_a_week, max_criticalalert_in_a_week, min_alert_in_a_week
 #-----------------------------------------------------------------------------------------------------------------
 # Feature extraction
 #  Three types og features are extracted
@@ -285,8 +303,14 @@ def GetAlertforADuration(TrainData, trainID, intervaltime):
 def ConvertTimeSeiresToSupervised(subdfTrainData, numberoflag):
     print('Convert time series into a Supervised learning problem')
     # First : add the original features ['AlertAboveThreshold' is the feature that we want to predict, so it is the y value, 'NumAlerts', 'NumCriticalAlerts' are the two time series given (x values)]
-    #data = pd.DataFrame(subdfTrainData[['Year', 'Month', 'WeekofYear', 'AlertAboveThreshold','NumAlerts', 'NumCriticalAlerts']].copy())
-    data = pd.DataFrame(subdfTrainData[['AlertAboveThreshold','NumAlerts', 'NumCriticalAlerts']].copy())
+
+    if(featureflagall==True):
+        print('Using all features ')
+        data = pd.DataFrame(subdfTrainData[['Year', 'Month', 'WeekofYear', 'AlertAboveThreshold','NumAlerts', 'NumCriticalAlerts','Maintenance']].copy())
+    #data = pd.DataFrame(subdfTrainData[['AlertAboveThreshold','NumAlerts', 'NumCriticalAlerts','Maintenance']].copy())
+    else:
+        print('Using a small set including only important features ')
+        data = pd.DataFrame(subdfTrainData[['AlertAboveThreshold','NumAlerts', 'NumCriticalAlerts']].copy())
 
     # Second : add raw lag data - add the lag of the target variable from 1 to 4 weeks
     for i in range(1, numberoflag):
@@ -329,6 +353,72 @@ def ConvertTimeSeiresToSupervised(subdfTrainData, numberoflag):
     #print('Feature extraction = ', data.head(10))
     return data
 
+#----------------------------------------------------------------------------------------------------------
+#Function : CalculateWeightedAverage(TrainDataRecord,max_alert_in_a_week, min_alert_in_a_week) -
+# Calculate the weighted average of alerts for a duration
+#----------------------------------------------------------------------------------------------------------
+def CalculateWeightedAverage(TrainDataRecord,max_alert_in_a_week, min_alert_in_a_week):
+    weightedAlertAvg=0
+    binsize = len(TrainDataRecord.keys())
+    binLength = round((max_alert_in_a_week - min_alert_in_a_week)/binsize)
+    print('max =', max_alert_in_a_week, '   min= ', min_alert_in_a_week, '   Num of bin = ',binsize,  '  each bin length = ', binLength)
+    weightvalue ={}
+    startval = min_alert_in_a_week
+    endval = min_alert_in_a_week + binLength
+    frequency =0
+    weight = 0
+
+    #Step 1 : prepare the bin with the lenght of data
+    for i in range(binsize+2):
+        weightvalue[i]={'startval':startval, 'endval':endval,'freq':frequency, 'weight':weight}
+        #print('Index = ',i, weightvalue[i])
+        startval = endval + 1
+        endval = (startval-1)+binLength
+
+    #Step 2: populate the bins to calculate coverage
+    for datakey in TrainDataRecord.keys():
+        numalt =int(TrainDataRecord[datakey]['NumAlerts'])
+        #print('Key value = ', TrainDataRecord[datakey]['NumAlerts'])
+        for binkey in weightvalue.keys():
+            #print(weightvalue[binkey]['startval'])
+            if numalt >= int(weightvalue[binkey]['startval']):
+                if numalt <= int(weightvalue[binkey]['endval']):
+                    countoccureance = int(weightvalue[binkey]['freq'])+1
+                    weightvalue[binkey]['freq'] = countoccureance
+                    #print('num =', numalt, '   range =', weightvalue[binkey]['startval'], ' - ', weightvalue[binkey]['endval'], '  updated occurance = ', weightvalue[binkey]['freq'])
+                    break
+
+    #Step 3: Calculate the weight for each bin considering the occurance
+    for binkey in weightvalue.keys():
+        totoccurance = int(weightvalue[binkey]['freq'])
+        if int(weightvalue[binkey]['freq']) > 0 :
+            binweight = float(int(weightvalue[binkey]['freq'])/ len(weightvalue.keys()))
+            weightvalue[binkey]['weight'] = round(binweight,4)
+            #print('weight val = ', binweight)
+        #print('index =', binkey, '   range =', weightvalue[binkey]['startval'], ' - ', weightvalue[binkey]['endval'], '  occurance = ', weightvalue[binkey]['freq'], '  Weight = ', weightvalue[binkey]['weight'])
+
+    #Step4 : Finally  - Calculate the weighted average [Formula : weighted_average = sum(df['Values'] * df['Weights']) / sum(df['Weights'])]
+    #print('Final Sept - Calculate Weighted Average :')
+    sumValueWeight = 0
+    sumWeight = 0
+    weightedaverageValue=0
+    for datakey in TrainDataRecord.keys():
+        numalt =int(TrainDataRecord[datakey]['NumAlerts'])
+        for binkey in weightvalue.keys():
+            #print('Num alert = ', numalt)
+            if numalt >= int(weightvalue[binkey]['startval']):
+                if numalt <= int(weightvalue[binkey]['endval']):
+                    bweight = float(weightvalue[binkey]['weight'])
+                    valueweight = (numalt * bweight)
+                    sumValueWeight = sumValueWeight+ valueweight
+                    sumWeight = sumWeight +bweight
+                    #print('Num alert for week = ', numalt, 'Found bin key index = ',  binkey,'  Weight  = ', bweight, 'Valueweight = ', valueweight, ' sumweight = ', sumWeight, '   sumvalweight = ', sumValueWeight)
+                    break
+
+    if(sumValueWeight > 0  and sumWeight > 0):  # weighted average value
+        weightedAlertAvg = float(sumValueWeight/sumWeight)#the weighted average
+    #print('Weighted average = ', weightedAlertAvg)
+    return weightedAlertAvg
 
 #----------------------------------------------------------------------------------------------------------
 #Function : timeseries_train_test_split(X, y, test_size) -  Perform train-test split with respect to time series structure.
@@ -353,138 +443,79 @@ def LoadProcessedTrainData(filename):
     TrainDataD = pickle.load(open(filename, "rb"))
     #print(TrainDataD)
     return TrainDataD
-#----------------------------------------------------------------------------------------------------------
-#Function : RandomWalk_BaselineModel() - Baseline classifier to compare
 
-'''def RandomWalk_BaselineModel():
-    # random prediction
-    print('Random walk')
+#----------------------------------------------------------------------------------------------------------
+#Function : RandomWalk_BaselineModel() - Baseline classifier to compare the prediction results of ML algorithms
+#----------------------------------------------------------------------------------------------------------
+def RandomWalk_BaselineModel(Y_data,y_train, y_test, algoname, AlertThresholdPercentage, trainID):
+    print('----------------------------------------------------------------------------------------------------------\n'
+          'Baseline Model - Random walk Model\n'
+          '-------------------------------------------------------------------------------------------------------------')
     actualtest =[]
     predicted=[]
 
     predictions = list()
-    history = train[varname][len(train[varname])]
-    print('history = ', history, 'test = ', len(train[varname]))
+    print('train data size= ', len(y_train), len(Y_data))
+    #history = y_train[varname][len(train[varname])]
+    history = y_train[len(y_train)]
+    #print(len(y_train))
+    #print('history = ', history, 'training set size = ', len(y_train))
 
-    for i in range(len(subdfTrainData[varname])+1):
-        if i > (len(train[varname])):
+    for i in range(len(Y_data)+1):
+        if i > (len(y_train)):
             randomval = random.random()
-            print('i val = ', i, 'random val = ', randomval)
+            #print('i val = ', i, 'random val = ', randomval)
             if randomval<0.5:
                 yhat = history -1
             else:
                 yhat = history +1
+
+            history = yhat
+
+            if(yhat>0.5):
+                yhat=1
+            else:
+                yhat=0
         #yhat = history + (-1 if np.random() < 0.5 else 1)
-
-            print('test val , ', history, 'pred = ', yhat)
+            #print('i val = ', i, 'random val = ', randomval, '  y predicted = ', history,'  y predicted final = ', yhat, '   y atual = ', Y_data[i])
+            #print('test val = ', history, 'predicted = ', yhat, '   actual =', y_test[i])
             predicted.append(yhat)
-            actualtest.append(test[varname][i])
-            #history = yhat
-    print('out')
+            actualtest.append(Y_data[i])
+
+    #print('out')
     print(actualtest, predicted)
-    error = np.square(np.subtract(actualtest,predicted)).mean()#mean_squared_error(test[varname], dfp)
-    rsmev = math.sqrt(error)
-    print('Random WALK RMSE: %.3f' % rsmev)
-'''
-#----------------------------------------------------------------------------------------------------------
-#     Supervised Machine Learning algorithms
-#----------------------------------------------------------------------------------------------------------
-#-------------Regression models---------------------------------------------------------------------------------------------
-#Function : LinearRegressionModel(trainX, trainy, testX, testy)
-def LinearRegressionModel(trainX, trainy, testX, testy):
-    model = LinearRegression()
-    model.fit(trainX, trainy)
-    prediction = model.predict(testX)
-    error = mean_absolute_percentage_error(prediction, testy)
-    #print('Linear regression, MAE = ', error)
-    #print('prediction = ', prediction)
-
-    plt.figure(figsize=(15, 7))
-    x = range(prediction.size)
-    plt.plot(x, prediction, label='prediction', linewidth=2.0)
-    plt.plot(x, testy, label='actual', linewidth=2.0)   
-    plt.title('Linear Regression -bMean absolute percentage error {0:.2f}%'.format(error))
-    plt.legend(loc='best')
-    plt.tight_layout()
-    plt.grid(True)
-    plt.show()
-
-    return error
-
-def RandomForestRegressor(trainX, trainy, testX, testy):
-    model = RandomForestRegressor(max_depth=6, n_estimators=100) # Random forest regression
-    model.fit(trainX, trainy)
-    prediction = model.predict(testX)
-    print('prediction = ', prediction)
-    print('Actual Data = ', y_test)
-
     # get the prediction accuracy
-    accuracy = accuracy_score(y_test, prediction)
-    precision = precision_score(y_test, prediction)
-    recall = recall_score(y_test, prediction)
+    accuracy = accuracy_score(actualtest, predicted)
+    precision = precision_score(actualtest, predicted)
+    recall = recall_score(actualtest, predicted)
+    f1 = 0#f1_score(predicted, actualtest, average="weighted")
 
-    print("Precision:", precision)
-    print("Recall:", recall)
-    print("built in funciton Accuracy:", accuracy)
-
-    y_true = np.array(testy)
+    y_true = np.array(actualtest)
     sumvalue = np.sum(y_true)
-    mape = np.sum(np.abs((y_true - prediction))) / sumvalue * 100
-    accuracy = 100 - mape
-    print('Accuracy:', round(accuracy, 2), '%.')
+    # mape = np.sum(np.abs((y_true - prediction))) / sumvalue * 100
+    mape = mae(actualtest, predicted)
+    print('Precision:', precision, '    Recall:', recall,'    Accuracy:', accuracy, '   F1 Score : ', f1  ,'   MeanAbsoluteError:', mape)
 
-    #plot actual and predicted value
-    plt.figure(figsize=(15, 7))
+    # Generate classification report & store it using pickle dump
+    classificaitonReport = classification_report(actualtest, predicted)
+    #print('Classification Report = ', classificaitonReport)
 
-    x = range(prediction.size)
-    plt.plot(x, prediction, label='prediction', linewidth=2.0)
-    plt.plot(x, testy, label='actual', linewidth=2.0)
-    error = mean_absolute_percentage_error(prediction, testy)
-    plt.title('Random Forests - Mean absolute percentage error {0:.2f}%'.format(error))
-    plt.legend(loc='best')
-    plt.xlabel('Number of Days')
-    plt.ylabel('Number of alerts will exceed threshold')
-    plt.tight_layout()
-    plt.grid(True)
-    plt.show()
-    return error
-
-#----------------------------------------------------------------------------------------------------------
-#Function : SupportVectorRegression(trainX, trainy, testX, testy)
-#----------------------------------------------------------------------------------------------------------
-def SupportVectorRegression(X_train, y_train, X_test, y_test):
-    scaler = MinMaxScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
-
-    model = SVR(kernel='rbf', gamma=0.5, C=10, epsilon=0.05)
-    model.fit(X_train, y_train)
-
-    y_train_pred = model.predict(X_train).reshape(-1, 1) #make prediction
-    y_test_pred = model.predict(X_test).reshape(-1, 1)
-    error = mean_absolute_percentage_error(y_test_pred.ravel(), y_test.ravel())
-
-    y_test_pred[y_test_pred > 0.5] = 1
-    y_test_pred[y_test_pred <= 0.5] = 0
-    y_test_pred = y_test_pred.astype(int)
-
-
-    plt.figure(figsize=(15, 7))
-    x = range(y_test_pred.size)
-    plt.plot(x, y_test_pred, label='prediction', linewidth=2.0)
-    plt.plot(x, y_test, label='actual', linewidth=2.0)
-    plt.title('Support Vector Regression - Mean absolute percentage error {0:.2f}%'.format(error))
-    plt.legend(loc='best')
-    plt.tight_layout()
-    plt.grid(True)
-    plt.show()
-
-    return error
-
+    #error = np.square(np.subtract(actualtest,predicted)).mean()#mean_squared_error(test[varname], dfp)
+    #rsmev = math.sqrt(error)
+    #accuracy = 100 - (error*100) #accuracy_score(y_test, predicted)
+    #print('Random WALK RMSE: %.3f' % rsmev, 'Accuracy: ', accuracy, '\n-----------------------------------------------------------')#, '  precision :', precision, '   recall:',recall, '  f1:',f1)
 
 #--------#Random Forest forecasting algorithm-----------------------------------------------------------------
 #Random Forest Classifier
 # #Function : RandomForest(trainX, trainy, testX, testy)
+#This function also performs hyperparameter tuning for a random forest classifier using random search. First, a dictionary param_dist is
+#created with two hyperparameters to tune: n_estimators and max_depth. The values for these hyperparameters are randomly sampled from a
+# uniform distribution between 50 and 500 for n_estimators and between 1 and 20 for max_depth. Next, a RandomForestClassifier object is
+# created. Then, a RandomizedSearchCV object is created with the RandomForestClassifier object, the param_dist dictionary, and other
+# parameters such as n_iter (the number of parameter settings that are sampled) and cv (the number of cross-validation folds to use).
+# Finally, the RandomizedSearchCV object is fit to the training data (X_train and y_train) to find the best hyperparameters for the
+# random forest classifier.
+
 #----------------------------------------------------------------------------------------------------------
 def RandomForestClassificationAlgo(trainX, trainy, testX, testy):
     print('Running Random Forest classifier........')
@@ -499,7 +530,13 @@ def RandomForestClassificationAlgo(trainX, trainy, testX, testy):
 
     # Create a series containing feature importances from the model and feature names from the training data
     feature_importances = pd.Series(best_rf_model.feature_importances_, index=X_train.columns).sort_values(ascending=False)
+    print('Random Forests - Feature Importance result = ', feature_importances.values)
     feature_importances.plot.bar() # Plot a simple bar chart
+    plt.title('Random Forest Classifier - Feature Importance')
+    plt.xlabel('Features')
+    plt.ylim(0,(max(feature_importances.values)+0.2))
+    plt.savefig(outputlocation+'\\Plot\\'+trainID+'\\RandomForest-FeatureImportance.png')
+    #plt.show()
     return prediction
 
 #----------------------------------------------------------------------------------------------------------
@@ -533,13 +570,22 @@ def KNearestNeighborsClassifier(X_train, y_train, X_test, y_test):
     X_train = scaler.fit_transform(X_train)
     X_test = scaler.transform(X_test)
 
-    model = KNeighborsClassifier(n_neighbors=3)
+
+    #nsamples, nx, ny = X_train.shape
+    #d2_X_train_dataset = X_train.reshape((nsamples, nx * ny))
+
+
+
+    #model = KNeighborsClassifier(n_neighbors=5,algorithm='auto',n_jobs=10)
+    model = KNeighborsTimeSeriesClassifier(distance="euclidean")
+
     model.fit(X_train, y_train)
     #nsamples, nx, ny = train_dataset.shape
     #d2_train_dataset = train_dataset.reshape((nsamples, nx * ny))
     
 
     prediction = model.predict([X_test]) # Predict Output
+    print('k neighbor')
 
     print('prediction = ', prediction)
     print('Actual Data = ', y_test)
@@ -569,16 +615,16 @@ def KNearestNeighborsClassifier(X_train, y_train, X_test, y_test):
     plt.show()
 
     #hyper parameter tunning (need to do it with walk through validation instead of cross-fold validation)
-    '''
+
     k_values = [i for i in range(1, 31)]
     scores = []
 
     scaler = StandardScaler()
-    X = scaler.fit_transform(X)
+    X = 0#scaler.fit_transform(X)
 
     for k in k_values:
         knn = KNeighborsClassifier(n_neighbors=k)
-        score = cross_val_score(knn, X, y, cv=5)
+        score = 0#cross_val_score(knn, X, y, cv=5)
         scores.append(np.mean(score))
         
     best_index = np.argmax(scores)
@@ -586,7 +632,7 @@ def KNearestNeighborsClassifier(X_train, y_train, X_test, y_test):
 
     knn = KNeighborsClassifier(n_neighbors=best_k) # retraining with the best k val
     knn.fit(X_train, y_train)
-'''
+
     return error
 #----------------------------------------------------------------------------------------------------------
 #Function : Naive-Bayes(trainX, trainy, testX, testy)
@@ -663,37 +709,6 @@ def XGBRegressorForecasting(X_train, y_train, X_test, y_test):
 
     return error
 
-#------------------Hyperparameter Tuning--------------------------------------------------------------------
-#Hyperparameter tuning for Random Forest
-#This function is performing hyperparameter tuning for a random forest classifier using random search. First, a dictionary param_dist is
-#created with two hyperparameters to tune: n_estimators and max_depth. The values for these hyperparameters are randomly sampled from a
-# uniform distribution between 50 and 500 for n_estimators and between 1 and 20 for max_depth. Next, a RandomForestClassifier object is
-# created. Then, a RandomizedSearchCV object is created with the RandomForestClassifier object, the param_dist dictionary, and other
-# parameters such as n_iter (the number of parameter settings that are sampled) and cv (the number of cross-validation folds to use).
-# Finally, the RandomizedSearchCV object is fit to the training data (X_train and y_train) to find the best hyperparameters for the
-# random forest classifier.
-
-def RandomForest_HyperparameterTunning(X_train, y_train):
-    param_dist = {'n_estimators': randint(50, 500),
-                  'max_depth': randint(1, 20)}
-
-    rf = RandomForestClassifier()  # Create a random forest classifier
-
-    rand_search = RandomizedSearchCV(rf,   # Use random search to find the best hyperparameters
-                                     param_distributions=param_dist,
-                                     n_iter=5,
-                                     cv=5)
-
-    rand_search.fit(X_train, y_train)  # Fit the random search object to the data
-    best_rf = rand_search.best_estimator_   # Create a variable for the best model
-    print('Best hyperparameters:', rand_search.best_params_) # Print the best hyperparameters
-
-    # Create a series containing feature importances from the model and feature names from the training data
-    feature_importances = pd.Series(best_rf.feature_importances_, index=X_train.columns).sort_values(ascending=False)
-
-    # Plot a simple bar chart
-    feature_importances.plot.bar()
-
 '''
 def walk_forward_validation(data, percentage=0.2):
 # In this case -1 is the target column (last one)
@@ -720,22 +735,31 @@ def AlgorithmValidation(alertthresholdpercentage, y_prediction, y_actual, algona
     #print('Actual Data = ', y_actual)
 
     # get the prediction accuracy
-    accuracy = accuracy_score(y_test, y_prediction)
-    precision = precision_score(y_test, y_prediction)
-    recall = recall_score(y_test, y_prediction)
-    f1 = f1_score(y_prediction, y_test, average="weighted")
+    accuracy = accuracy_score(y_actual, y_prediction)
+    precision = precision_score(y_actual, y_prediction)
+    recall = recall_score(y_actual, y_prediction)
+    f1 = f1_score(y_prediction, y_actual, average="weighted")
 
     y_true = np.array(y_actual)
     sumvalue = np.sum(y_true)
     #mape = np.sum(np.abs((y_true - prediction))) / sumvalue * 100
     mape = mae(y_actual, y_prediction)
     #print('Precision:', precision, '    Recall:', recall,'    Accuracy:', accuracy, '   F1 Score : ', f1  ,'   MeanAbsoluteError:', mape)
-    # Create the confusion matrix
-    cm = confusion_matrix(y_test, y_prediction)
 
-    ConfusionMatrixDisplay(confusion_matrix=cm).plot();
+    # Generate classification report & store it using pickle dump
+    classificaitonReport = classification_report(y_actual, y_prediction)
+    #print('Classification Report = ', classificaitonReport)
+    classificationresultpath = outputlocation + '\\Plot\\' + trainID +'\\ClassificationReport'
+    pickle.dump(classificaitonReport, open(classificationresultpath, "wb"))
 
-    # plot actual and predicted value
+    # Create and plot the confusion matrix
+    cm = confusion_matrix(y_actual, y_prediction)
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm)
+    disp.plot()
+    #plt.savefig(outputlocation + '\\Plot\\' + trainid + '\\' + algoname + '_AlertThresholdPercentage' + str(alertthresholdpercentage) + '_ConfusionMatrix.png')
+    plt.savefig(outputlocation + '\\Plot\\' + trainid + '\\' + algoname + '_ConfusionMatrix.png')
+
+# plot actual and predicted value
     plt.figure(figsize=(15, 7))
     x = range(y_prediction.size)
     plt.plot(x, y_prediction, label='prediction', linewidth=2.0)
@@ -748,7 +772,8 @@ def AlgorithmValidation(alertthresholdpercentage, y_prediction, y_actual, algona
     plt.tight_layout()
     plt.grid(True)
     #plt.show()
-    plt.savefig(outputlocation+'\\Plot\\'+trainid+'\\'+algoname+'_AlertThresholdPercentage'+str(alertthresholdpercentage)+'_Prediction.png')
+    #plt.savefig(outputlocation+'\\Plot\\'+trainid+'\\'+algoname+'_AlertThresholdPercentage'+str(alertthresholdpercentage)+'_Prediction.png')
+    plt.savefig(outputlocation+'\\Plot\\'+trainid+'\\'+algoname+'_Prediction.png')
     return precision, recall, accuracy, f1, mape
 
 #---------------------------------------------------------------------------------------------------
@@ -758,6 +783,7 @@ def AlgorithmValidation(alertthresholdpercentage, y_prediction, y_actual, algona
 # MLAlgoName=['Random Forest', 'Support Vector Machine','Logistic Regression']
 #-----------------------------------------------------------------------------------------------------
 def TimeSeriesForecastingWithMLAlgo(X_train, y_train, X_test, y_test, algoname, AlertThresholdPercentage,trainID):
+    print('\n\n------------------Starting Time series forecasting using ML algorithms -------------')
     if (algoname =='Random Forest'):  # **. Random Forest Classification Algorithm
         y_prediction = RandomForestClassificationAlgo(X_train, y_train, X_test, y_test)
 
@@ -776,9 +802,6 @@ def TimeSeriesForecastingWithMLAlgo(X_train, y_train, X_test, y_test, algoname, 
 #------------------------------------------------------------------------------------
 # Press the green button in the gutter to run the script.
 if __name__ == '__main__':
-    trainname ='TSR'
-    trainnumber = '064'  # T1 =070, T2 = 086, T3 =040, T4 = 008, T5=020 , T6=033, T7=, T8= ,T9=
-    traincomponent ='TCU'
     trainDiagnosticfilename =dataInputLocation +"\\DiagnosticData\\"+trainname+" "+trainnumber+".csv"
     trainMaintenanceDatafilename = dataInputLocation +"\\MaintenanceData\\Avvisi SAP - Interventi manutentivi.xlsx"
     datasheetname =trainname+" "+trainnumber
@@ -799,7 +822,9 @@ if __name__ == '__main__':
 # Analysis the data and sampling
 # ----------------------------------------------------------------------------------------------------------------
     # sample data according to chosen slot
-    TrainDataRecord, max_alert_in_a_week, max_criticalalert_in_a_week = GetAlertforADuration(TrainDataDiagosticMaintenance, trainID, intervaltime)
+    TrainDataRecord, max_alert_in_a_week, max_criticalalert_in_a_week, min_alert_in_a_week = GetAlertforADuration(TrainDataDiagosticMaintenance, trainID, intervaltime)
+    weightedAvgNumAlert = CalculateWeightedAverage(TrainDataRecord,max_alert_in_a_week, min_alert_in_a_week)
+    print('Weighted Average = ', weightedAvgNumAlert)
 
 # ----------------------------------------------------------------------------------------------------------------
 #  Extracting the feature, Run the experiments varying the Threshold level for alerts
@@ -814,10 +839,14 @@ if __name__ == '__main__':
         print('Algo Name = ', algoname)
         while (AlertThresholdPercentage <= 0.6):  # Iterate over a range of alert threshold for each algorithm
             #Define the threshold and extract features
-            AlertThresholdPercentage=round(AlertThresholdPercentage,2)
-            alertthreshold = round((max_alert_in_a_week * AlertThresholdPercentage), 2)
-            criticalalertthreshold = round((max_criticalalert_in_a_week * AlertThresholdPercentage), 2)
+            #--------------------------------
+            #AlertThresholdPercentage=round(AlertThresholdPercentage,2)
+            #alertthreshold = round((max_alert_in_a_week * AlertThresholdPercentage), 2)
+            #criticalalertthreshold = round((max_criticalalert_in_a_week * AlertThresholdPercentage), 2)
+            #-----------------------------
 
+            alertthreshold =  weightedAvgNumAlert
+            criticalalertthreshold=0
             print('Alert Threshold Percentage = ', AlertThresholdPercentage, '   Alert Threshold = ', alertthreshold, '   Critical alert threshold = ', criticalalertthreshold)
             #TrainDataFeture = FeatureExtractionFromPerDayData(TrainDataDiagosticMaintenance, alertthreshold, criticalalertthreshold)  # Extract suitable feature
             # Feature extraction from sampled (weekly, biweekly, monthly sampled bin) data
@@ -837,14 +866,19 @@ if __name__ == '__main__':
 
             X = TrainfeatureData.drop(outputFeatureName, axis=1)
             y = TrainfeatureData[outputFeatureName]
-        # ----------------------------------------------------------------------------------------------------------------
+
+            # ----------------------------------------------------------------------------------------------------------------
         # # Dividing into train and test set
         # ----------------------------------------------------------------------------------------------------------------
             test_size=testdatasize
             X_train, X_test,y_train, y_test = timeseries_train_test_split(X, y, test_size)
 
-            #print('Train ', y_train)
+            print('Train set size =', len(y_train), '  Test set size = ', len(y_test))
             #print('Train ', y_test)
+            # Compare with the baseline random walk model
+            RandomWalk_BaselineModel(y,y_train, y_test, algoname, AlertThresholdPercentage, trainID) # BaseLine algorithm
+
+
         # ----------------------------------------------------------------------------------------------------------------
         #  Hyperparameter Tuning - for different ML algo
         # ----------------------------------------------------------------------------------------------------------------
@@ -853,6 +887,9 @@ if __name__ == '__main__':
         #------------------------------------------------------------------------------------------------------------
             # Apply different ML supervised classification algorithms
         #---------------------------------------------------------------------------------------------
+            #KNearestNeighborsClassifier(X_train, y_train, X_test, y_test)
+            #NaiveBayesClassification(X_train, y_train, X_test, y_test)
+
             # Run time series forecasting with differnt ML algorithms and collect results
             precision, recall, accuracy, f1score, mape = TimeSeriesForecastingWithMLAlgo(X_train, y_train, X_test, y_test, algoname, AlertThresholdPercentage, trainID)
 
@@ -861,53 +898,12 @@ if __name__ == '__main__':
             if dickey not in MLPredictionModelEvaluation.keys():
                 MLPredictionModelEvaluation[dickey] = {'Accuracy':accuracy,'F1Score':f1score,'Precision ':precision, 'Recall':recall, 'MeanAbsoluteEerror':mape}
 
-            # **. Support Vector Machine - Classification Algorithm
-            #y_prediction = SupportVectorMachine(X_train, y_train, X_test, y_test)
-            #precisionsvm, recallsvm, accuracysvm, f1scoresvm, mapesvm= AlgorithmValidation(AlertThresholdPercentage, y_prediction, y_test, 'Support Vector Machine', trainID)
 
-            # **. Support Vector Machine - Classification Algorithm
-            #y_prediction = LogisticRegressionModel(X_train, y_train, X_test, y_test)
-            #precisionlr, recallr, accuracylr, f1scorelr, mapelr = AlgorithmValidation(AlertThresholdPercentage, y_prediction, y_test,'Logistic Regression', trainID)
 
-            #maelr = LinearRegressionModel(X_train, y_train, X_test, y_test)
-
-            #maesvr = SupportVectorRegression(X_train, y_train, X_test, y_test)
-            #maesvr = SupportVectorMachine(X_train, y_train, X_test, y_test)
-            #maexgbre=XGBRegressorForecasting(X_train, y_train, X_test, y_test)
-            #maenv = NaiveBayesClassification(X_train, y_train, X_test, y_test)
-            #maeknn = KNearestNeighborsClassifier(X_train, y_train, X_test, y_test)
-            #maeknn = LogisticRegressionModel    (X_train, y_train, X_test, y_test)
-            #print('X_test  before scaling = ', X_test)
-
-            #print('random forest - Precision = ', precisionrf, '  Recall = ', recallrf, '   Accuracy = ', accuracyrf, '  F1 score = ', f1scorerf, '   MAE =', maperf )
-            #print('Support Vector Machine - Precision = ', precisionsvm, '  Recall = ', recallsvm, '   Accuracy = ', accuracysvm, '  F1 score = ', f1scoresvm, '   MAE =', mapesvm )
-            #print('Logistic Regression - Precision = ', precisionlr, '  Recall = ', recallr, '   Accuracy = ', accuracylr, '  F1 score = ', f1scorelr, '   MAE =', mapelr )
-            #walk forward validation
-            #test_rmse, Y_test, predictions = walk_forward_validation(df, 0.2)
             AlertThresholdPercentage =AlertThresholdPercentage+ 0.1  # Increase the AlertThreshold
             break
             #print(len(y_train_pred), len(y_test_pred))
-            '''
-            print('----------------Mean absolute error for different ML algo ----------------')
-            print('Linear Regression = ', maelr)
-            print('Random Forest = ', maerf)
-            print('Support Vector Regression = ', maesvr)
-            print('XGB Regression = ', maexgbre)
-        
-            '''
-            # create a dataframe with the variable importances of the model
-            '''
-            df_importances = pd.DataFrame({
-                'feature': model.feature_name_,
-                'importance': model.feature_importances_
-            }).sort_values(by='importance', ascending=False)
-        
-            # plot variable importances of the model
-            plt.title('Variable Importances', fontsize=16)
-            sns.barplot(x=df_importances.importance, y=df_importances.feature, orient='h')
-            plt.show()
-    
-            '''
+
 
 
     #Finally printing and storing the results
